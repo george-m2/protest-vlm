@@ -1,0 +1,68 @@
+{
+  "model": "unum-cloud/uform-gen2-qwen-500m",
+  "revision": "78dc2e4d600def7698d5fb3733bea4e22dd2f3f9",
+  "tokenizer": "Qwen/Qwen1.5-0.5B-Chat",
+  "tokenizer_revision": "4d14e384a4b037942bb3f3016665157c8bcb70ea",
+  "files": [
+    {
+      "path": ".models/uform/config.json",
+      "sha256": "d30e29613eae5d3a090e35d10054ac01a1dbba93afa8235ec62af6bf587a4bb5"
+    },
+    {
+      "path": ".models/uform/configuration_uform_gen.py",
+      "sha256": "2f6ca540e32c17e3cfe9402d8c399c719c2eaeb0234802b9e32ed1e8b27356d1"
+    },
+    {
+      "path": ".models/uform/generation_config.json",
+      "sha256": "69d76e6b0a3b31f0de871f8f5b968957e0532fd9b17214aabf151da4bdbe1804"
+    },
+    {
+      "path": ".models/uform/model-00001-of-00002.safetensors",
+      "sha256": "745e8e2f2087905cee61b46e74b181681484d3e0d7ecbef3189e472b3fd78329"
+    },
+    {
+      "path": ".models/uform/model-00002-of-00002.safetensors",
+      "sha256": "27ce47ee20f96a21f8c7ac2a1be36d838b973b5af28b2b0b0e993b86c8a35a27"
+    },
+    {
+      "path": ".models/uform/model.safetensors.index.json",
+      "sha256": "be0ad4fe6c36751817eccc0c52c21d593c6b2ba29036580e593b13c3c808e61f"
+    },
+    {
+      "path": ".models/uform/modeling_uform_gen.py",
+      "sha256": "ad65e81c41c8dbc2f1627018f17a0ecb497c271ef1aab12200172d92160f230d"
+    },
+    {
+      "path": ".models/uform/processing_uform_gen.py",
+      "sha256": "d1d772e023706c56a92a7534cbc13b584f209e7b4130a8f4c4c6f3bfd9a0eb74"
+    },
+    {
+      "path": ".models/uform/README.md",
+      "sha256": "691ecff3e84f4494481980a56a224af091e7b79aec52d53bdf416bc95da44138"
+    },
+    {
+      "path": ".models/uform/vision_encoder.py",
+      "sha256": "aec35c163e56398854a9a41124833746ab49f17928289c3dbc81dacbe5dd85e0"
+    },
+    {
+      "path": ".models/qwen_tokenizer/config.json",
+      "sha256": "adac3bb8bf1b15c74312a2835e3796f6b352d817ff726960e1d5c2cd171da951"
+    },
+    {
+      "path": ".models/qwen_tokenizer/merges.txt",
+      "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3"
+    },
+    {
+      "path": ".models/qwen_tokenizer/tokenizer.json",
+      "sha256": "f7c9b2dba4a296b1aa76c16a34b8225c0c118978400d4bb66bff0902d702f5b8"
+    },
+    {
+      "path": ".models/qwen_tokenizer/tokenizer_config.json",
+      "sha256": "482bd979881423375ca5414e4e0d94cd7c5349dbb17fffd46b4d36d71e62a1bc"
+    },
+    {
+      "path": ".models/qwen_tokenizer/vocab.json",
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    }
+  ]
+}

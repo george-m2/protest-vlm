@@ -1,0 +1,80 @@
+[
+  {
+    "id": "protest_march",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/c/c3/1963_march_on_washington.jpg",
+    "source": "https://commons.wikimedia.org/wiki/File:1963_march_on_washington.jpg",
+    "credit": "Rowland Scherman / U.S. Information Agency / National Archives",
+    "event": "March on Washington 1963",
+    "path": "data/images/protest_march.jpg",
+    "download_url": "https://upload.wikimedia.org/wikipedia/commons/c/c3/1963_march_on_washington.jpg",
+    "sha256": "96fb091de34eaf2889644332632e9ed6bbfda03b3f88e87c316d726104997c4e",
+    "original_sha256": "27f4c517d69d1a7502b1ba9acd19e983c2e77e69762225804a40fb0d24b90336",
+    "rights": "Public-domain / no-known-restrictions archival sources selected in the earlier pilot; retain and review linked source rights.",
+    "preprocessing": "EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop"
+  },
+  {
+    "id": "protest_memorial",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/7/75/1963_march_lincoln_memorial.jpg",
+    "source": "https://commons.wikimedia.org/wiki/File:1963_march_lincoln_memorial.jpg",
+    "credit": "U.S. Information Agency / National Archives",
+    "event": "March on Washington 1963",
+    "path": "data/images/protest_memorial.jpg",
+    "download_url": "https://upload.wikimedia.org/wikipedia/commons/7/75/1963_march_lincoln_memorial.jpg",
+    "sha256": "4d1645b412e5d6fe760947be839dc09c4bb659f1f22c67c3ac808dd0ac84ee9a",
+    "original_sha256": "2ec555553a68354f0507b77b0fad82113222519687d3b2fa867128ec36d5194c",
+    "rights": "Public-domain / no-known-restrictions archival sources selected in the earlier pilot; retain and review linked source rights.",
+    "preprocessing": "EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop"
+  },
+  {
+    "id": "protest_police",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/4/45/Civil_rights_march_on_Washington%2C_D.C._police_line.jpg",
+    "source": "https://commons.wikimedia.org/wiki/File:Civil_rights_march_on_Washington,_D.C._police_line.jpg",
+    "credit": "Marion S. Trikosko / Library of Congress",
+    "event": "March on Washington 1963",
+    "path": "data/images/protest_police.jpg",
+    "download_url": "https://upload.wikimedia.org/wikipedia/commons/4/45/Civil_rights_march_on_Washington%2C_D.C._police_line.jpg",
+    "sha256": "b30236b4c3b2743bfacffeab81bd58ede466d48de8cde54ea5d3002e06a71b49",
+    "original_sha256": "423704c2ae81c527ffe122ded7b6c9ac435379c360331446aaa58512f2b31783",
+    "rights": "Public-domain / no-known-restrictions archival sources selected in the earlier pilot; retain and review linked source rights.",
+    "preprocessing": "EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop"
+  },
+  {
+    "id": "protest_suffrage",
+    "url": "https://cdn.loc.gov/service/pnp/ggbain/11300/11383v.jpg",
+    "source": "https://www.loc.gov/item/2014691470/",
+    "credit": "Bain News Service / Library of Congress",
+    "event": "Suffrage parade catalogued 1913",
+    "path": "data/images/protest_suffrage.jpg",
+    "download_url": "https://cdn.loc.gov/service/pnp/ggbain/11300/11383v.jpg",
+    "sha256": "795567d0494c9f7bc6f0110e68ebf6eca8e3bbc41536ce9badabab79736dea93",
+    "original_sha256": "60d1148fc27a890459427718db5fe85e27e5cb6829bbfc59d690d6ca94de5206",
+    "rights": "Public-domain / no-known-restrictions archival sources selected in the earlier pilot; retain and review linked source rights.",
+    "preprocessing": "EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop"
+  },
+  {
+    "id": "control_boardwalk",
+    "url": "https://cdn.loc.gov/service/pnp/cph/3c00000/3c07000/3c07800/3c07839v.jpg",
+    "source": "https://www.loc.gov/item/93506594/",
+    "credit": "George Grantham Bain Collection / Library of Congress",
+    "event": "Coney Island 1908",
+    "path": "data/images/control_boardwalk.jpg",
+    "download_url": "https://cdn.loc.gov/service/pnp/cph/3c00000/3c07000/3c07800/3c07839v.jpg",
+    "sha256": "d229875773775ec9ec7513c4c6b8a1aae0af46315771328ebf0f091c3b7e0559",
+    "original_sha256": "235aeb78044331f7ef69a6f18b8680ca9d1eb8e9724e69a8d6b1c1e4b76472a4",
+    "rights": "Public-domain / no-known-restrictions archival sources selected in the earlier pilot; retain and review linked source rights.",
+    "preprocessing": "EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop"
+  },
+  {
+    "id": "control_station",
+    "url": "https://cdn.loc.gov/service/pnp/fsa/8c33000/8c33100/8c33198v.jpg",
+    "source": "https://www.loc.gov/item/2017820721/",
+    "credit": "John Collier Jr. / Library of Congress",
+    "event": "Grand Central Terminal 1941",
+    "path": "data/images/control_station.jpg",
+    "download_url": "https://cdn.loc.gov/service/pnp/fsa/8c33000/8c33100/8c33198v.jpg",
+    "sha256": "2fd9de029193a2306905c798cd1b3b7bc89eb54b85b9d5f58993267fa7c3cdf9",
+    "original_sha256": "2c232e8aef9d9615c572d393a9f86d69f22f3652f3f104a9d239033ef7e77b97",
+    "rights": "Public-domain / no-known-restrictions archival sources selected in the earlier pilot; retain and review linked source rights.",
+    "preprocessing": "EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop"
+  }
+]
