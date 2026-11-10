@@ -1,10 +1,12 @@
-"""Run the protest image pilot on CPU."""
+"""CPU pilot helpers. Importing this module does not download or run a model."""
 
 from pathlib import Path
 import hashlib
 import json
 import os
 import random
+import re
+import time
 import urllib.request
 
 MODEL = 'unum-cloud/uform-gen2-qwen-500m'
@@ -55,6 +57,8 @@ def fetch(url, limit=12_000_000):
 def prepare_inputs(root):
     """Download the photographs, model and tokenizer."""
     os.environ['HF_HUB_DISABLE_XET'] = '1'
+    for name in ['HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE']:
+        os.environ.pop(name, None)
     from PIL import Image, ImageOps
     from huggingface_hub import snapshot_download
     root = Path(root).resolve()
@@ -101,8 +105,70 @@ def prepare_inputs(root):
     print('Inputs ready.', flush=True)
 
 
+def prepare_extra_images(root, sample):
+    """Explicitly download optional photographs into a separate, reusable manifest."""
+    from PIL import Image, ImageOps
+    root = Path(root).resolve()
+    manifest_path = root / 'data/intersectional_manifest.json'
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if [item['id'] for item in manifest] != [item['id'] for item in sample]:
+            raise ValueError('The optional image selection changed; preserve the existing manifest first.')
+        for item, spec in zip(manifest, sample):
+            if any(item.get(key) != value for key, value in spec.items()):
+                raise ValueError(f"Optional source metadata changed: {item['id']}")
+            if digest(root / item['path']) != item['sha256']:
+                raise ValueError(f"Image has changed: {item['id']}")
+            if digest(root / item['original_path']) != item['original_sha256']:
+                raise ValueError(f"Original image has changed: {item['id']}")
+        return manifest
+    manifest = []
+    for spec in sample:
+        if not re.fullmatch(r'[a-z0-9_]+', spec['id']):
+            raise ValueError('Use simple lowercase image IDs')
+        original = root / 'data/intersectional_originals' / (spec['id'] + '.jpg')
+        processed = root / 'data/intersectional_images' / (spec['id'] + '.jpg')
+        original.parent.mkdir(parents=True, exist_ok=True)
+        processed.parent.mkdir(parents=True, exist_ok=True)
+        if not original.exists():
+            original.write_bytes(fetch(spec['url']))
+        with Image.open(original) as source:
+            image = ImageOps.exif_transpose(source).convert('RGB')
+            image.thumbnail((768, 768), Image.Resampling.LANCZOS)
+            image.save(processed, quality=92)
+        item = dict(spec)
+        item.update(path=processed.relative_to(root).as_posix(),
+                    original_path=original.relative_to(root).as_posix(),
+                    download_url=spec['url'], sha256=digest(processed),
+                    original_sha256=digest(original),
+                    preprocessing='EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop')
+        manifest.append(item)
+        print('Prepared', item['id'], flush=True)
+    save_json(manifest_path, manifest)
+    return manifest
+
+
+def parse_answer(text):
+    """Conservative yes/no extraction; other answers remain available for human review."""
+    if not isinstance(text, str):
+        return 'unparseable'
+    match = re.match(r'^\s*(yes|no)(?=$|[\s.,!?:;])', text, re.I)
+    uncertainty = (
+        r'\b(?:maybe|uncertain|unclear|unsure|ambiguous|possibly|perhaps)\b',
+        r"\b(?:cannot|can't|could not|couldn't)\s+(?:determine|tell|say|be sure)\b",
+        r'\bnot\s+(?:sure|certain|clear)\b',
+        r'\bno\s+(?:way|means)\s+to\s+(?:tell|determine|know)\b',
+        r'\b(?:yes\s+(?:or|and)\s+no|no\s+(?:or|and)\s+yes)\b',
+    )
+    if not match or any(re.search(pattern, text, re.I) for pattern in uncertainty):
+        return 'unparseable'
+    return match.group(1).lower()
+
+
 def print_output(row):
     heading = f"{row['image_id']} | {row['task']} | {row['condition']}"
+    if 'identity' in row:
+        heading += f" | {row['identity']} | {row['source']} | {row['prompt_style']}"
     if row['repeat']:
         heading += f" | repeat {row['repeat']}"
     print(f"\n{heading}\n{row['prompt']}")
@@ -114,8 +180,9 @@ def print_output(row):
             print('[Token limit reached]', flush=True)
 
 
-def run_experiment(root, results_name='results', limit=0):
-    """Print and save each response, skipping calls already saved."""
+def run_experiment(root, results_name='results', limit=0, *, jobs=None,
+                   extra_manifest_path=None, design=None):
+    """Run the original plan or notebook-specified trials; resume identical plans only."""
     if limit < 0:
         raise ValueError('limit must be 0 (all calls) or a positive number')
 
@@ -133,6 +200,8 @@ def run_experiment(root, results_name='results', limit=0):
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     manifest = json.loads((root / 'data/manifest.json').read_text(encoding='utf-8'))
+    if extra_manifest_path:
+        manifest += json.loads((root / extra_manifest_path).read_text(encoding='utf-8'))
     lock = json.loads((root / 'model_lock.json').read_text(encoding='utf-8'))
     if not manifest or len({item['id'] for item in manifest}) != len(manifest):
         raise ValueError('The image manifest must contain unique image IDs')
@@ -140,24 +209,41 @@ def run_experiment(root, results_name='results', limit=0):
         if digest(root / item['path']) != item['sha256']:
             raise ValueError(f"File has changed: {item['path']}")
 
-    jobs = []
-    for item in manifest:
-        for task, question in TASKS.items():
-            conditions = FRAMES if task == 'violence' else ['baseline']
-            for condition in conditions:
-                jobs.append(dict(
-                    image_id=item['id'], task=task, condition=condition,
-                    repeat=0, prompt=FRAMES[condition] + question,
-                ))
-    for task in ['protest', 'police', 'violence']:
-        jobs.append(dict(
-            image_id=manifest[0]['id'], task=task, condition='baseline',
-            repeat=1, prompt=TASKS[task],
-        ))
+    custom_jobs = jobs is not None
+    if custom_jobs:
+        jobs = [dict(job) for job in jobs]
+        required = {'image_id', 'task', 'condition', 'repeat', 'prompt', 'trial_id',
+                    'identity', 'race_label', 'gender_label', 'source', 'prompt_style', 'image_set'}
+        available = {item['id'] for item in manifest}
+        if not jobs or any(not required.issubset(job) for job in jobs):
+            raise ValueError('Intersectional trials need all factor fields and unique trial IDs')
+        if any(job['image_id'] not in available or job['task'] not in TASKS for job in jobs):
+            raise ValueError('A trial names an unknown image or task')
+        if any(not isinstance(job['prompt'], str) or not job['prompt'].strip() for job in jobs):
+            raise ValueError('Every trial needs a nonempty prompt')
+        selected = {job['image_id'] for job in jobs}
+        manifest = [item for item in manifest if item['id'] in selected]
+    else:
+        jobs = []
+        for item in manifest:
+            for task, question in TASKS.items():
+                conditions = FRAMES if task == 'violence' else ['baseline']
+                for condition in conditions:
+                    jobs.append(dict(
+                        image_id=item['id'], task=task, condition=condition,
+                        repeat=0, prompt=FRAMES[condition] + question,
+                    ))
+        for task in ['protest', 'police', 'violence']:
+            jobs.append(dict(
+                image_id=manifest[0]['id'], task=task, condition='baseline',
+                repeat=1, prompt=TASKS[task],
+            ))
     for job in jobs:
-        job['trial_id'] = '__'.join(
+        job.setdefault('trial_id', '__'.join(
             str(job[key]) for key in ['image_id', 'task', 'condition', 'repeat']
-        )
+        ))
+    if len({job['trial_id'] for job in jobs}) != len(jobs):
+        raise ValueError('Trial IDs must be unique')
     random.Random(20261107).shuffle(jobs)
 
     generation = dict(
@@ -173,6 +259,8 @@ def run_experiment(root, results_name='results', limit=0):
         threads=4, device='cpu', dtype='float32', seed=20261107,
         versions=versions, python=platform.python_version(),
     )
+    if custom_jobs:
+        plan.update(design=design or {}, implementation_sha256=digest(__file__))
     fingerprint = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
     plan['fingerprint'] = fingerprint
 
@@ -200,6 +288,7 @@ def run_experiment(root, results_name='results', limit=0):
     torch.set_num_threads(4)
     torch.manual_seed(20261107)
     torch.use_deterministic_algorithms(True)
+    started = time.perf_counter()
     model_dir = root / '.models/uform'
     config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True, local_files_only=True)
     config.text_decoder_name_or_path = str(root / '.models/qwen_tokenizer')
@@ -211,12 +300,16 @@ def run_experiment(root, results_name='results', limit=0):
         'processing_uform_gen.VLMProcessor', str(model_dir), local_files_only=True,
     )
     processor = processor_cls(config)
+    if {parameter.device.type for parameter in model.parameters()} != {'cpu'}:
+        raise RuntimeError('This pilot requires CPU inference')
+    load_seconds = time.perf_counter() - started
     lookup = {item['id']: item for item in manifest}
 
     with raw_path.open('a', encoding='utf-8') as handle:
         for job in pending:
             item = lookup[job['image_id']]
             row = dict(job, fingerprint=fingerprint, image_sha256=item['sha256'])
+            tick = time.perf_counter()
             try:
                 with Image.open(root / item['path']) as source:
                     image = source.convert('RGB')
@@ -230,15 +323,26 @@ def run_experiment(root, results_name='results', limit=0):
                 answer = processor.decode(ids, skip_special_tokens=True)
                 row.update(
                     status='ok', raw_text=answer, generated_tokens=len(ids),
+                    parsed_label=None if job['task'] == 'caption' else parse_answer(answer),
                     truncated=len(ids) >= generation['max_new_tokens']
                     and ids[-1] != generation['eos_token_id'],
                 )
             except Exception as error:
-                row.update(status='error', raw_text='', error=f'{type(error).__name__}: {error}')
+                row.update(status='error', raw_text='', parsed_label='unparseable', truncated=False,
+                           elapsed_seconds=time.perf_counter() - tick,
+                           error=f'{type(error).__name__}: {error}')
                 handle.write(json.dumps(row, ensure_ascii=False) + '\n')
                 handle.flush()
+                os.fsync(handle.fileno())
                 print_output(row)
                 raise
+            row['elapsed_seconds'] = time.perf_counter() - tick
             handle.write(json.dumps(row, ensure_ascii=False) + '\n')
             handle.flush()
+            os.fsync(handle.fileno())
             print_output(row)
+    save_json(output / f'session_{time.time_ns()}.json', dict(
+        device='cpu', model_load_seconds=load_seconds,
+        elapsed_seconds=time.perf_counter() - started,
+        calls_this_session=len(pending), fingerprint=fingerprint,
+    ))
