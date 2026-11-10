@@ -1,5 +1,3 @@
-"""CPU pilot helpers. Importing this module does not download or run a model."""
-
 from pathlib import Path
 import hashlib
 import json
@@ -180,24 +178,49 @@ def print_output(row):
             print('[Token limit reached]', flush=True)
 
 
-def run_experiment(root, results_name='results', limit=0, *, jobs=None,
-                   extra_manifest_path=None, design=None):
-    """Run the original plan or notebook-specified trials; resume identical plans only."""
-    if limit < 0:
+def run_experiment(root, results_name='results_t4', limit=0, *, jobs=None,
+                   extra_manifest_path=None, design=None,
+                   device='cuda:0', dtype='float16'):
+    """Run on one CUDA GPU; preserve the trial design and resume identical plans only."""
+    if not isinstance(limit, int) or limit < 0:
         raise ValueError('limit must be 0 (all calls) or a positive number')
+    if dtype not in {'float16', 'float32'}:
+        raise ValueError('For T4 use float16, or float32 for a precision comparison; not bfloat16.')
 
     root = Path(root).resolve()
     os.environ.update(
-        CUDA_VISIBLE_DEVICES='', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
+        HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
         HF_HOME=str(root / '.cache/huggingface'),
         HF_MODULES_CACHE=str(root / '.cache/modules'), TOKENIZERS_PARALLELISM='false',
+        CUBLAS_WORKSPACE_CONFIG=':4096:8',
     )
     import importlib.metadata
     import platform
     import torch
     from PIL import Image
+    from torch.nn.attention import SDPBackend, sdpa_kernel
     from transformers import AutoConfig, AutoModel
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    device = torch.device(device)
+    if device.type != 'cuda':
+        raise ValueError('This branch targets a CUDA GPU. Use the CPU version on master for CPU runs.')
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            'No CUDA GPU is available. In Colab select Runtime > Change runtime type > T4 GPU. '
+            'Restart the session after changing hardware or installing dependencies. '
+            'Keep Colab\'s CUDA-enabled torch/torchvision pair; do not install CPU wheels.'
+        )
+    device = torch.device('cuda', device.index if device.index is not None else 0)
+    torch.cuda.set_device(device)
+    properties = torch.cuda.get_device_properties(device)
+    compute_dtype = {'float16': torch.float16, 'float32': torch.float32}[dtype]
+    hardware = dict(
+        name=properties.name, compute_capability=list(torch.cuda.get_device_capability(device)),
+        total_memory_gib=properties.total_memory / 1024**3,
+        cuda_runtime=torch.version.cuda, cudnn_version=torch.backends.cudnn.version(),
+    )
+    print(f'GPU: {hardware["name"]}; device: {device}; precision: {dtype}', flush=True)
 
     manifest = json.loads((root / 'data/manifest.json').read_text(encoding='utf-8'))
     if extra_manifest_path:
@@ -252,15 +275,20 @@ def run_experiment(root, results_name='results', limit=0, *, jobs=None,
     )
     versions = {
         name: importlib.metadata.version(name)
-        for name in ['torch', 'torchvision', 'transformers', 'tokenizers', 'numpy', 'Pillow']
+        for name in ['torch', 'torchvision', 'transformers', 'tokenizers', 'numpy', 'Pillow',
+                     'accelerate', 'huggingface-hub', 'safetensors']
     }
     plan = dict(
         jobs=jobs, model_lock=lock, images=manifest, generation=generation,
-        threads=4, device='cpu', dtype='float32', seed=20261107,
+        threads=4, device=str(device), dtype=dtype, seed=20261107,
+        hardware=hardware, attention_backend='sdpa_math',
+        deterministic_algorithms=True, cublas_workspace_config=':4096:8',
+        allow_tf32=False, cudnn_benchmark=False,
+        implementation_sha256=digest(__file__),
         versions=versions, python=platform.python_version(),
     )
     if custom_jobs:
-        plan.update(design=design or {}, implementation_sha256=digest(__file__))
+        plan['design'] = design or {}
     fingerprint = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
     plan['fingerprint'] = fingerprint
 
@@ -287,45 +315,61 @@ def run_experiment(root, results_name='results', limit=0, *, jobs=None,
 
     torch.set_num_threads(4)
     torch.manual_seed(20261107)
+    torch.cuda.manual_seed_all(20261107)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True)
+    torch.cuda.synchronize(device)
     started = time.perf_counter()
     model_dir = root / '.models/uform'
     config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True, local_files_only=True)
     config.text_decoder_name_or_path = str(root / '.models/qwen_tokenizer')
     model = AutoModel.from_pretrained(
         str(model_dir), config=config, trust_remote_code=True,
-        local_files_only=True, torch_dtype=torch.float32, low_cpu_mem_usage=True,
-    ).to('cpu').eval()
+        local_files_only=True, torch_dtype=compute_dtype, low_cpu_mem_usage=True,
+    ).to(device).eval()
     processor_cls = get_class_from_dynamic_module(
         'processing_uform_gen.VLMProcessor', str(model_dir), local_files_only=True,
     )
     processor = processor_cls(config)
-    if {parameter.device.type for parameter in model.parameters()} != {'cpu'}:
-        raise RuntimeError('This pilot requires CPU inference')
+    if any(parameter.device != device for parameter in model.parameters()):
+        raise RuntimeError('All model parameters must reside on the selected CUDA GPU.')
+    torch.cuda.synchronize(device)
     load_seconds = time.perf_counter() - started
+    session_peak_allocated_gib = torch.cuda.memory_allocated(device) / 1024**3
     lookup = {item['id']: item for item in manifest}
 
     with raw_path.open('a', encoding='utf-8') as handle:
         for job in pending:
             item = lookup[job['image_id']]
             row = dict(job, fingerprint=fingerprint, image_sha256=item['sha256'])
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
             tick = time.perf_counter()
             try:
                 with Image.open(root / item['path']) as source:
                     image = source.convert('RGB')
                 inputs = processor(text=[job['prompt']], images=[image], return_tensors='pt')
-                inputs = {key: value.to('cpu') for key, value in inputs.items()}
-                with torch.inference_mode():
+                # Cast image tensors only: token IDs and attention masks must remain integers.
+                inputs = {
+                    key: value.to(device=device, dtype=compute_dtype if value.is_floating_point() else value.dtype)
+                    for key, value in inputs.items()
+                }
+                # The math SDPA path supports T4; no FlashAttention package is required.
+                with torch.inference_mode(), sdpa_kernel(SDPBackend.MATH):
                     tokens = model.generate(
                         **inputs, **generation, pad_token_id=processor.tokenizer.pad_token_id,
                     )
-                ids = tokens[0, inputs['input_ids'].shape[1]:].tolist()
+                ids = tokens[0, inputs['input_ids'].shape[1]:].detach().cpu().tolist()
+                torch.cuda.synchronize(device)
                 answer = processor.decode(ids, skip_special_tokens=True)
                 row.update(
                     status='ok', raw_text=answer, generated_tokens=len(ids),
                     parsed_label=None if job['task'] == 'caption' else parse_answer(answer),
                     truncated=len(ids) >= generation['max_new_tokens']
-                    and ids[-1] != generation['eos_token_id'],
+                    and bool(ids) and ids[-1] != generation['eos_token_id'],
                 )
             except Exception as error:
                 row.update(status='error', raw_text='', parsed_label='unparseable', truncated=False,
@@ -337,12 +381,19 @@ def run_experiment(root, results_name='results', limit=0, *, jobs=None,
                 print_output(row)
                 raise
             row['elapsed_seconds'] = time.perf_counter() - tick
+            row['gpu_peak_allocated_gib'] = torch.cuda.max_memory_allocated(device) / 1024**3
+            row['gpu_peak_reserved_gib'] = torch.cuda.max_memory_reserved(device) / 1024**3
+            session_peak_allocated_gib = max(session_peak_allocated_gib, row['gpu_peak_allocated_gib'])
             handle.write(json.dumps(row, ensure_ascii=False) + '\n')
             handle.flush()
             os.fsync(handle.fileno())
             print_output(row)
+            del inputs, tokens
     save_json(output / f'session_{time.time_ns()}.json', dict(
-        device='cpu', model_load_seconds=load_seconds,
+        device=str(device), dtype=dtype, hardware=hardware, model_load_seconds=load_seconds,
+        gpu_peak_allocated_gib=session_peak_allocated_gib,
         elapsed_seconds=time.perf_counter() - started,
         calls_this_session=len(pending), fingerprint=fingerprint,
     ))
+    del model, processor
+    torch.cuda.empty_cache()
