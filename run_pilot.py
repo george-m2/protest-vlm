@@ -5,6 +5,7 @@ import os
 import random
 import re
 import time
+from shutil import copy2
 import urllib.request
 
 MODEL = 'unum-cloud/uform-gen2-qwen-500m'
@@ -87,7 +88,6 @@ def prepare_inputs(root):
                         rights='Public-domain / no-known-restrictions archival sources selected in the earlier pilot; retain and review linked source rights.',
                         preprocessing='EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop')
             manifest.append(item)
-            print('Prepared', item['id'], flush=True)
         save_json(manifest_path, manifest)
     model_dir = root / '.models/uform'
     tokenizer_dir = root / '.models/qwen_tokenizer'
@@ -95,12 +95,11 @@ def prepare_inputs(root):
                       allow_patterns=['*.py', '*.json', '*.safetensors', 'README.md'])
     snapshot_download(TOKENIZER, revision=TOKENIZER_REVISION, local_dir=tokenizer_dir,
                       allow_patterns=['config.json', 'tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt'])
-    files = [p for directory in (model_dir, tokenizer_dir) for p in directory.iterdir() if p.is_file()]
+    files = sorted(p for directory in (model_dir, tokenizer_dir) for p in directory.iterdir() if p.is_file())
     lock = {'model': MODEL, 'revision': REVISION, 'tokenizer': TOKENIZER,
             'tokenizer_revision': TOKENIZER_REVISION,
             'files': [{'path': p.relative_to(root).as_posix(), 'sha256': digest(p)} for p in files]}
     save_json(root / 'model_lock.json', lock)
-    print('Inputs ready.', flush=True)
 
 
 def prepare_extra_images(root, sample):
@@ -141,7 +140,6 @@ def prepare_extra_images(root, sample):
                     original_sha256=digest(original),
                     preprocessing='EXIF orientation, RGB, fit within 768 pixels, JPEG quality 92, no crop')
         manifest.append(item)
-        print('Prepared', item['id'], flush=True)
     save_json(manifest_path, manifest)
     return manifest
 
@@ -178,73 +176,60 @@ def print_output(row):
             print('[Token limit reached]', flush=True)
 
 
+def study_settings(plan):
+    # Compare the inputs that affect answers. Older plans also hashed the entire script.
+    lock = plan['model_lock']
+    files = {f['path']: f['sha256'] for f in lock['files']
+             if Path(f['path']).suffix in {'.py', '.json', '.safetensors', '.txt'}}
+    images = {item['id']: item['sha256'] for item in plan['images']}
+    return (plan['jobs'], images, lock['model'], lock['revision'], lock['tokenizer'],
+            lock['tokenizer_revision'], files, plan['generation'], plan['dtype'],
+            plan['device'].split(':')[0], plan['seed'], plan.get('attention_backend'),
+            plan.get('allow_tf32'), plan.get('deterministic_algorithms'),
+            plan.get('cublas_workspace_config'), plan.get('cudnn_benchmark'))
+
+
+def saved_trials(plan, previous, rows):
+    """Return the completed trial IDs, or None if this log belongs to another run."""
+    if previous is None or study_settings(previous) != study_settings(plan):
+        return None
+    jobs = {job['trial_id']: job for job in plan['jobs']}
+    images = {image['id']: image['sha256'] for image in plan['images']}
+    done = set()
+    for row in rows:
+        trial = row['trial_id']
+        job = jobs.get(trial)
+        if (trial in done or job is None or row['status'] != 'ok'
+                or row['fingerprint'] != previous['fingerprint']
+                or row['image_sha256'] != images[job['image_id']]
+                or any(row.get(k) != v for k, v in job.items())):
+            return None
+        done.add(trial)
+    return done
+
+
 def run_experiment(root, results_name='results_t4', limit=0, *, jobs=None,
                    extra_manifest_path=None, design=None,
                    device='cuda:0', dtype='float16'):
-    """Run on one CUDA GPU; preserve the trial design and resume identical plans only."""
+    """Reuse recorded trials and generate the remaining responses on one CUDA GPU."""
     if not isinstance(limit, int) or limit < 0:
         raise ValueError('limit must be 0 (all calls) or a positive number')
     if dtype not in {'float16', 'float32'}:
-        raise ValueError('For T4 use float16, or float32 for a precision comparison; not bfloat16.')
+        raise ValueError('dtype must be float16 or float32')
 
     root = Path(root).resolve()
-    os.environ.update(
-        HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
-        HF_HOME=str(root / '.cache/huggingface'),
-        HF_MODULES_CACHE=str(root / '.cache/modules'), TOKENIZERS_PARALLELISM='false',
-        CUBLAS_WORKSPACE_CONFIG=':4096:8',
-    )
-    import importlib.metadata
-    import platform
-    import torch
-    from PIL import Image
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    from transformers import AutoConfig, AutoModel
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-    device = torch.device(device)
-    if device.type != 'cuda':
-        raise ValueError('This branch targets a CUDA GPU. Use the CPU version on master for CPU runs.')
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            'No CUDA GPU is available. In Colab select Runtime > Change runtime type > T4 GPU. '
-            'Restart the session after changing hardware or installing dependencies. '
-            'Keep Colab\'s CUDA-enabled torch/torchvision pair; do not install CPU wheels.'
-        )
-    device = torch.device('cuda', device.index if device.index is not None else 0)
-    torch.cuda.set_device(device)
-    properties = torch.cuda.get_device_properties(device)
-    compute_dtype = {'float16': torch.float16, 'float32': torch.float32}[dtype]
-    hardware = dict(
-        name=properties.name, compute_capability=list(torch.cuda.get_device_capability(device)),
-        total_memory_gib=properties.total_memory / 1024**3,
-        cuda_runtime=torch.version.cuda, cudnn_version=torch.backends.cudnn.version(),
-    )
-    print(f'GPU: {hardware["name"]}; device: {device}; precision: {dtype}', flush=True)
-
     manifest = json.loads((root / 'data/manifest.json').read_text(encoding='utf-8'))
     if extra_manifest_path:
         manifest += json.loads((root / extra_manifest_path).read_text(encoding='utf-8'))
     lock = json.loads((root / 'model_lock.json').read_text(encoding='utf-8'))
     if not manifest or len({item['id'] for item in manifest}) != len(manifest):
         raise ValueError('The image manifest must contain unique image IDs')
-    for item in manifest + lock['files']:
-        if digest(root / item['path']) != item['sha256']:
-            raise ValueError(f"File has changed: {item['path']}")
-
     custom_jobs = jobs is not None
     if custom_jobs:
         jobs = [dict(job) for job in jobs]
-        required = {'image_id', 'task', 'condition', 'repeat', 'prompt', 'trial_id',
-                    'identity', 'race_label', 'gender_label', 'source', 'prompt_style', 'image_set'}
-        available = {item['id'] for item in manifest}
-        if not jobs or any(not required.issubset(job) for job in jobs):
-            raise ValueError('Intersectional trials need all factor fields and unique trial IDs')
-        if any(job['image_id'] not in available or job['task'] not in TASKS for job in jobs):
-            raise ValueError('A trial names an unknown image or task')
-        if any(not isinstance(job['prompt'], str) or not job['prompt'].strip() for job in jobs):
-            raise ValueError('Every trial needs a nonempty prompt')
         selected = {job['image_id'] for job in jobs}
+        if selected.difference(item['id'] for item in manifest):
+            raise ValueError('A trial refers to a photograph outside the manifest.')
         manifest = [item for item in manifest if item['id'] in selected]
     else:
         jobs = []
@@ -273,82 +258,127 @@ def run_experiment(root, results_name='results_t4', limit=0, *, jobs=None,
         do_sample=False, num_beams=1, max_new_tokens=48,
         use_cache=True, eos_token_id=151645,
     )
-    versions = {
-        name: importlib.metadata.version(name)
-        for name in ['torch', 'torchvision', 'transformers', 'tokenizers', 'numpy', 'Pillow',
-                     'accelerate', 'huggingface-hub', 'safetensors']
-    }
     plan = dict(
         jobs=jobs, model_lock=lock, images=manifest, generation=generation,
         threads=4, device=str(device), dtype=dtype, seed=20261107,
-        hardware=hardware, attention_backend='sdpa_math',
-        deterministic_algorithms=True, cublas_workspace_config=':4096:8',
-        allow_tf32=False, cudnn_benchmark=False,
-        implementation_sha256=digest(__file__),
-        versions=versions, python=platform.python_version(),
+        attention_backend='sdpa_math', deterministic_algorithms=True,
+        cublas_workspace_config=':4096:8', allow_tf32=False, cudnn_benchmark=False,
     )
     if custom_jobs:
         plan['design'] = design or {}
-    fingerprint = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
-    plan['fingerprint'] = fingerprint
 
+    from filelock import FileLock
     output = root / results_name
     output.mkdir(parents=True, exist_ok=True)
-    raw_path = output / 'raw_outputs.jsonl'
-    existing = []
-    if raw_path.exists():
-        existing = [json.loads(line) for line in raw_path.read_text(encoding='utf-8').splitlines() if line]
-    if any(row['fingerprint'] != fingerprint for row in existing):
-        raise ValueError('The experiment settings have changed. Choose a new results_name.')
-    if any(row['status'] != 'ok' for row in existing):
-        raise ValueError('This run contains a failed call. Fix the cause and choose a new results_name.')
-    done = {row['trial_id'] for row in existing}
-    if len(done) != len(existing) or not done.issubset({job['trial_id'] for job in jobs}):
-        raise ValueError('The results contain duplicate or unknown calls')
-    pending = [job for job in jobs if job['trial_id'] not in done]
-    if limit:
-        pending = pending[:limit]
-    save_json(output / 'experiment_plan.json', plan)
-    if not pending:
-        print('All responses are already saved.')
-        return
+    with FileLock(str(output / '.run.lock')):
+        raw_path = output / 'raw_outputs.jsonl'
+        plan_path = output / 'experiment_plan.json'
+        previous = json.loads(plan_path.read_text(encoding='utf-8')) if plan_path.exists() else None
+        rows = []
+        if raw_path.exists():
+            with raw_path.open(encoding='utf-8') as log:
+                rows = [json.loads(line) for line in log if line.strip()]
+        done = saved_trials(plan, previous, rows)
+        if done and len(done) == len(jobs):
+            for row in rows:
+                print_output(row)
+            return
 
-    torch.set_num_threads(4)
-    torch.manual_seed(20261107)
-    torch.cuda.manual_seed_all(20261107)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
-    torch.cuda.synchronize(device)
-    started = time.perf_counter()
-    model_dir = root / '.models/uform'
-    config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True, local_files_only=True)
-    config.text_decoder_name_or_path = str(root / '.models/qwen_tokenizer')
-    model = AutoModel.from_pretrained(
-        str(model_dir), config=config, trust_remote_code=True,
-        local_files_only=True, torch_dtype=compute_dtype, low_cpu_mem_usage=True,
-    ).to(device).eval()
-    processor_cls = get_class_from_dynamic_module(
-        'processing_uform_gen.VLMProcessor', str(model_dir), local_files_only=True,
-    )
-    processor = processor_cls(config)
-    if any(parameter.device != device for parameter in model.parameters()):
-        raise RuntimeError('All model parameters must reside on the selected CUDA GPU.')
-    torch.cuda.synchronize(device)
-    load_seconds = time.perf_counter() - started
-    session_peak_allocated_gib = torch.cuda.memory_allocated(device) / 1024**3
-    lookup = {item['id']: item for item in manifest}
+        for item in manifest + lock['files']:
+            if digest(root / item['path']) != item['sha256']:
+                raise ValueError(f"File has changed: {item['path']}")
 
-    with raw_path.open('a', encoding='utf-8') as handle:
-        for job in pending:
-            item = lookup[job['image_id']]
-            row = dict(job, fingerprint=fingerprint, image_sha256=item['sha256'])
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-            tick = time.perf_counter()
-            try:
+        os.environ.update(
+            HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
+            HF_HOME=str(root / '.cache/huggingface'),
+            HF_MODULES_CACHE=str(root / '.cache/modules'), TOKENIZERS_PARALLELISM='false',
+            CUBLAS_WORKSPACE_CONFIG=':4096:8',
+        )
+        import importlib.metadata
+        import platform
+        import torch
+        from PIL import Image
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        from transformers import AutoConfig, AutoModel
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        device = torch.device(device)
+        if device.type != 'cuda' or not torch.cuda.is_available():
+            raise RuntimeError('A CUDA GPU is required to generate new responses.')
+        device = torch.device('cuda', device.index if device.index is not None else 0)
+        torch.cuda.set_device(device)
+        properties = torch.cuda.get_device_properties(device)
+        compute_dtype = {'float16': torch.float16, 'float32': torch.float32}[dtype]
+        hardware = dict(
+            name=properties.name, compute_capability=list(torch.cuda.get_device_capability(device)),
+            total_memory_gib=properties.total_memory / 1024**3,
+            cuda_runtime=torch.version.cuda, cudnn_version=torch.backends.cudnn.version(),
+        )
+        versions = {
+            name: importlib.metadata.version(name)
+            for name in ['torch', 'torchvision', 'transformers', 'tokenizers', 'numpy', 'Pillow',
+                         'accelerate', 'huggingface-hub', 'safetensors']
+        }
+        plan.update(device=str(device), hardware=hardware, versions=versions,
+                    python=platform.python_version(), implementation_sha256=digest(__file__))
+        # For a partial run, changes to the inference environment need a separate log.
+        resume = bool(done) and previous['hardware'] == hardware and previous['versions'] == versions
+        if resume:
+            fingerprint = previous['fingerprint']
+            pending = [job for job in jobs if job['trial_id'] not in done]
+        else:
+            fingerprint = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+            plan['fingerprint'] = fingerprint
+            pending = jobs
+        if limit:
+            pending = pending[:limit]
+
+        torch.set_num_threads(4)
+        torch.manual_seed(20261107)
+        torch.cuda.manual_seed_all(20261107)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+        torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        model_dir = root / '.models/uform'
+        config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True, local_files_only=True)
+        config.text_decoder_name_or_path = str(root / '.models/qwen_tokenizer')
+        model = AutoModel.from_pretrained(
+            str(model_dir), config=config, trust_remote_code=True,
+            local_files_only=True, torch_dtype=compute_dtype, low_cpu_mem_usage=True,
+        ).to(device).eval()
+        processor_cls = get_class_from_dynamic_module(
+            'processing_uform_gen.VLMProcessor', str(model_dir), local_files_only=True,
+        )
+        processor = processor_cls(config)
+        if any(parameter.device != device for parameter in model.parameters()):
+            raise RuntimeError('All model parameters must reside on the selected CUDA GPU.')
+        torch.cuda.synchronize(device)
+        load_seconds = time.perf_counter() - started
+        session_peak_allocated_gib = torch.cuda.memory_allocated(device) / 1024**3
+        lookup = {item['id']: item for item in manifest}
+
+        if not resume:
+            if rows:
+                archive = output / 'previous_runs' / str(time.time_ns())
+                archive.mkdir(parents=True)
+                if plan_path.exists():
+                    copy2(plan_path, archive / plan_path.name)
+                raw_path.replace(archive / raw_path.name)
+                for session in output.glob('session_*.json'):
+                    session.replace(archive / session.name)
+            save_json(plan_path, plan)
+
+        with raw_path.open('a', encoding='utf-8') as handle:
+            for job in pending:
+                item = lookup[job['image_id']]
+                row = dict(job, fingerprint=fingerprint, image_sha256=item['sha256'])
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+                tick = time.perf_counter()
                 with Image.open(root / item['path']) as source:
                     image = source.convert('RGB')
                 inputs = processor(text=[job['prompt']], images=[image], return_tensors='pt')
@@ -371,29 +401,20 @@ def run_experiment(root, results_name='results_t4', limit=0, *, jobs=None,
                     truncated=len(ids) >= generation['max_new_tokens']
                     and bool(ids) and ids[-1] != generation['eos_token_id'],
                 )
-            except Exception as error:
-                row.update(status='error', raw_text='', parsed_label='unparseable', truncated=False,
-                           elapsed_seconds=time.perf_counter() - tick,
-                           error=f'{type(error).__name__}: {error}')
+                row['elapsed_seconds'] = time.perf_counter() - tick
+                row['gpu_peak_allocated_gib'] = torch.cuda.max_memory_allocated(device) / 1024**3
+                row['gpu_peak_reserved_gib'] = torch.cuda.max_memory_reserved(device) / 1024**3
+                session_peak_allocated_gib = max(session_peak_allocated_gib, row['gpu_peak_allocated_gib'])
                 handle.write(json.dumps(row, ensure_ascii=False) + '\n')
                 handle.flush()
                 os.fsync(handle.fileno())
                 print_output(row)
-                raise
-            row['elapsed_seconds'] = time.perf_counter() - tick
-            row['gpu_peak_allocated_gib'] = torch.cuda.max_memory_allocated(device) / 1024**3
-            row['gpu_peak_reserved_gib'] = torch.cuda.max_memory_reserved(device) / 1024**3
-            session_peak_allocated_gib = max(session_peak_allocated_gib, row['gpu_peak_allocated_gib'])
-            handle.write(json.dumps(row, ensure_ascii=False) + '\n')
-            handle.flush()
-            os.fsync(handle.fileno())
-            print_output(row)
-            del inputs, tokens
-    save_json(output / f'session_{time.time_ns()}.json', dict(
-        device=str(device), dtype=dtype, hardware=hardware, model_load_seconds=load_seconds,
-        gpu_peak_allocated_gib=session_peak_allocated_gib,
-        elapsed_seconds=time.perf_counter() - started,
-        calls_this_session=len(pending), fingerprint=fingerprint,
-    ))
-    del model, processor
-    torch.cuda.empty_cache()
+                del inputs, tokens
+        save_json(output / f'session_{time.time_ns()}.json', dict(
+            device=str(device), dtype=dtype, hardware=hardware, model_load_seconds=load_seconds,
+            gpu_peak_allocated_gib=session_peak_allocated_gib,
+            elapsed_seconds=time.perf_counter() - started,
+            calls_this_session=len(pending), fingerprint=fingerprint,
+        ))
+        del model, processor
+        torch.cuda.empty_cache()
